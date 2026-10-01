@@ -145,6 +145,8 @@ dsh plugin --profile desktop exec dsh-workbuddy-xdpool reset     # clear all 429
 dsh plugin --profile desktop exec dsh-workbuddy-xdpool checkin   # today's check-in state per account (--json)
 dsh plugin --profile desktop exec dsh-workbuddy-xdpool checkin all
                                                                  # collect every account's daily reward (or pass one label)
+dsh plugin --profile desktop exec dsh-workbuddy-xdpool export    # bundle accounts + settings for another machine (--accounts-only / --settings-only)
+dsh plugin --profile desktop exec dsh-workbuddy-xdpool transfer  # import that file on the other machine
 dsh plugin --profile desktop exec dsh-workbuddy-xdpool login     # guide to adding another desktop account
 ```
 
@@ -161,6 +163,31 @@ dsh plugin --profile desktop exec dsh-workbuddy-xdpool remove myKey
 ```
 
 Snapshots are stored under `~/.dsh/.workbuddy-xdpool/` named by the **MD5-8 prefix** of their key (so keys with Chinese, `/`, or spaces are safe). Long-lived use relies on refresh-token auto-renewal; if it lapses, re-sign-in on the desktop and `import <key> --force`.
+
+## Moving to another machine: export / import
+
+Skip re-scanning a QR code for every account. Bundle this machine's accounts and settings into one file and carry it over.
+
+**On the card**: "Export" (top right of the XD Pool page) downloads the file; "Import" picks it back up.
+
+**From the terminal**:
+
+```sh
+dsh plugin --profile desktop exec dsh-workbuddy-xdpool export ./pool.json   # here
+dsh plugin --profile desktop exec dsh-workbuddy-xdpool transfer ./pool.json # on the other machine
+```
+
+The bundle carries **every account's token plus the plugin settings** (model selection, context caps, distribution, credit reserves, automation switch). Restart DSH after importing: accounts join the pool and the settings take effect.
+
+**The exported file is plaintext.** It is every account's tokens in the clear — treat it as a password list. Copy it straight to the target machine; do not route it through cloud drives, chat apps, or email, and delete it once done.
+
+A few details:
+
+- **Tokens are exported decrypted.** From 5.6.0 the desktop app seals its tokens with a key tied to the installed build, so a verbatim copy of its files opens only on the machine that produced it and reads as "not signed in" anywhere else. Plain values open everywhere.
+- **An import writes only the plugin's own directory** (`~/.dsh/.workbuddy-xdpool/`) and never touches the desktop app's files, so the session you are actually signed in with is left alone.
+- **The desktop app's live sign-in wins** for the same account: an imported copy is a point-in-time capture and never overrides the session in use.
+- If a token lapses, export again — or just sign that account in on the new machine.
+- `--accounts-only` exports credentials alone; `--settings-only` exports settings alone.
 
 ## Configuration
 
@@ -186,7 +213,8 @@ workbuddy-xdpool:
   - `scheduler.ts` — the points-automation scheduler: runs five jobs on local time points (check-in / report / tasks / streak / travel), persists the daily earnings ledger, and backs the card's "Run now" button with the same code path.
   - `task-events.ts` — builds the 13 task event chains. Each chain is plain data plus the fingerprint channel it must go out on (desktop or web); the tasks that need a REAL conversation (skill, experts) open one here to get the server-side id.
   - `catalog.ts` / `upstream.ts` — the upstream client: model catalog (with per-model multipliers and free / image tags), credits, check-in, and every automation endpoint, switching CN/global by credential domain.
-  - `web-status.ts` / `status-paths.ts` — the same-origin status document and routes the card reads. Mutations are gated on POST + loopback origin + an explicit `accountId`.
+  - `web-status.ts` / `status-paths.ts` — the same-origin status document and routes the card reads. Mutations are gated on POST + loopback origin + an explicit `accountId`; the export / import routes are the exception, and import takes the whole bundle file verbatim.
+  - `transfer.ts` — the machine-to-machine bundle: building, validating and writing it, plus the settings handoff file for the host. Tokens are **decrypted to plaintext here**, because the desktop app's encryption key follows the installed build and a verbatim copy cannot be read on another machine.
   - `bin.ts` — the CLI above.
 - **Client** (`src/client/`, the browser card loaded via `dsh.client`)
   The collapsible shell reuses the host's `dsm-plugin-card*` style language (`--dsw-alias-*` theme tokens); content classes are namespaced `dsm-workbuddy-xdpool-*`, and copy lives under the `settings.workbuddy-xdpool` namespace.
@@ -195,7 +223,9 @@ workbuddy-xdpool:
 
 ## Known limitations
 
-- **Only accounts on THIS machine's desktop app**: the pool cannot — and will not — sign you in or scan a QR code (tokens are minted by the WorkBuddy desktop app's own Tencent SSO and bound to the device). Adding an account = signing in on the desktop app; XD Pool absorbs it.
+- **Only accounts on THIS machine's desktop app**: the pool cannot — and will not — sign you in or scan a QR code (tokens are minted by the WorkBuddy desktop app's own Tencent SSO and bound to the device). Adding an account = signing in on the desktop app; XD Pool absorbs it. To move machines, use **export / import** rather than copying the desktop app's own files — those are encrypted and will not open elsewhere.
+
+- **The exported bundle is plaintext**: it carries decrypted tokens so it works across machines. Treat that file as a password list, in transit and at rest.
 
 - **A few automation tasks are deliberately not implemented**
   - `Expert_Philanthropy` (charity expert): requires a real donation; there is no way around it.

@@ -22,6 +22,7 @@ import {
 } from './adapter.ts'
 import { WorkBuddyScheduler, type AutomationJobKind, type AutomationLedger, type AutomationOptions } from './scheduler.ts'
 import type { UsageLedger } from './usage.ts'
+import { localDayKey } from './usage.ts'
 import { createWorkBuddyShim, type WorkBuddyShim } from './shim.ts'
 import { buildStatus } from './status.ts'
 export {
@@ -31,12 +32,25 @@ export {
 } from './scheduler.ts'
 import { regionOf, WorkBuddyUpstreamClient, type WorkBuddyRegion } from './upstream.ts'
 import { registerPoolStatusRoute } from './web-status.ts'
+import type { PoolWebTransferResult } from './status-paths.ts'
 import {
   ignoreAccount,
   ignoredIdsPath,
   readIgnoredAccountsSync,
   unignoreAccount,
 } from './ignored.ts'
+import {
+  TRANSFER_SETTING_KEYS,
+  buildBundle,
+  clearPendingSettings,
+  parseBundle,
+  pickTransferSettings,
+  readPendingSettings,
+  writeBundleAccounts,
+  writePendingSettings,
+  writeSettingsSnapshot,
+  type TransferSettings,
+} from './transfer.ts'
 
 import { fileURLToPath } from 'node:url'
 
@@ -108,6 +122,7 @@ export {
   type PoolWebModel,
   type PoolWebModelSelection,
   type PoolWebStatus,
+  type PoolWebTransferResult,
   type PoolWebUsageTotals,
 } from './status-paths.ts'
 export {
@@ -124,6 +139,38 @@ export {
   type IgnoredAccount,
 } from './ignored.ts'
 export type { ModelSelection } from './catalog.ts'
+
+// Machine-to-machine transfer: one bundle carrying every account plus the
+// transferable settings. Exported so a probe can exercise the round trip — the
+// format is the contract between two installs, so it is worth testing without a
+// live pool on either side.
+export {
+  BUNDLE_FORMAT,
+  BUNDLE_VERSION,
+  IMPORTED_FILE_PREFIX,
+  PENDING_SETTINGS_FILE_NAME,
+  SETTINGS_SNAPSHOT_FILE_NAME,
+  TRANSFER_SETTING_KEYS,
+  buildBundle,
+  clearPendingSettings,
+  credentialToDocument,
+  importedCredentialPath,
+  parseBundle,
+  pendingSettingsPath,
+  pickTransferSettings,
+  readPendingSettings,
+  readSettingsSnapshot,
+  serializeBundle,
+  settingsSnapshotPath,
+  writeBundleAccounts,
+  writePendingSettings,
+  writeSettingsSnapshot,
+  type TransferAccount,
+  type TransferApplyResult,
+  type TransferBundle,
+  type TransferSettings,
+  type TransferSkip,
+} from './transfer.ts'
 
 // The per-model daily usage ledger, and the SSE parsing that reads token counts
 // out of the upstream stream. Exported so a probe can exercise the counting
@@ -624,6 +671,31 @@ export function apply(ctx: Context, config: Config = {}): void {
    */
   let rawCurrent: () => Config = () => config
   const current = (): Config => unwrapVolatileDeep(rawCurrent())
+  /**
+   * The settings a transfer bundle carries.
+   *
+   * Defined once so the file mirror (for the CLI) and the card's download
+   * describe the same set: two lists would drift, and the drift would show up as
+   * "the CLI exported my model selection but the button did not".
+   *
+   * The earnings and usage ledgers are deliberately excluded — they are this
+   * machine's history, and carrying them to a fresh install would claim rewards
+   * and traffic that never happened there.
+   */
+  const transferableSettings = (): TransferSettings => {
+    const {
+      distribution, disabledAccountIds, creditReserves,
+      modelSelectionCn, modelSelectionGlobal, automation,
+    } = current()
+    return pickTransferSettings({
+      distribution: distribution ?? 'priority',
+      ...disabledAccountIds === undefined ? {} : { disabledAccountIds },
+      ...creditReserves === undefined ? {} : { creditReserves },
+      ...modelSelectionCn === undefined ? {} : { modelSelectionCn },
+      ...modelSelectionGlobal === undefined ? {} : { modelSelectionGlobal },
+      ...automation === undefined ? {} : { automation },
+    })
+  }
   const sectionHooks = {
     setSource(source: () => Config) { rawCurrent = source },
     onChange() { applyConfigFromSource() },
@@ -681,6 +753,18 @@ export function apply(ctx: Context, config: Config = {}): void {
     // re-arms it without a host restart. An absent block means off, which is why
     // this passes `enabled: false` explicitly rather than leaving it undefined.
     core.scheduler.applyConfig(automationOptions(automation))
+
+    // Mirror the transferable settings where the CLI can read them.
+    //
+    // `export` runs as its own process with no settings service, and the real
+    // document is the profile's patch YAML — layered, validated and rewritten by
+    // the host. Rather than have the CLI re-implement that merge, the host writes
+    // the resolved values it already holds. Best-effort: a failed mirror costs
+    // the settings half of an export, which `export` reports, and must never
+    // break a settings apply.
+    void writeSettingsSnapshot(transferableSettings()).catch((error: unknown) => {
+      ctx.logger.warn?.('dsh-workbuddy-xdpool: could not mirror settings for export', error)
+    })
   }
   // ---------------------------------------------------------------------
   // Settings registration, on whichever host line is running.
@@ -897,6 +981,46 @@ function canonicalJson(value: unknown): string {
   const storedUsage = current().modelUsage
   if (storedUsage !== undefined) core.pool.applyUsageLedger(storedUsage)
 
+  /**
+   * Apply a settings block staged by a CLI `transfer` run, then clear it.
+   *
+   * The CLI has no settings service: on this host line the settings live in the
+   * profile's patch document, which the host owns and rewrites. So `transfer`
+   * leaves the block in a small file and this consumes it through `setSetting`,
+   * the same verified write path every card edit uses — a staged block that the
+   * service refuses to persist therefore surfaces as a real error instead of
+   * being reported as applied.
+   *
+   * Consumed exactly once, at startup, which is what `transfer` tells the user to
+   * do. Applying it on every config change instead would re-assert the imported
+   * values over whatever the user edited on the card afterwards.
+   */
+  const applyPendingTransferSettings = async (): Promise<void> => {
+    const pending = await readPendingSettings()
+    if (pending === undefined) return
+    const settings = pickTransferSettings(pending)
+    const applied: string[] = []
+    try {
+      for (const key of TRANSFER_SETTING_KEYS) {
+        const value = settings[key]
+        if (value === undefined) continue
+        await setSetting(key, value, value)
+        applied.push(key)
+      }
+    } finally {
+      // Cleared even when a key failed: the block is a one-shot handoff, and
+      // leaving it behind would replay the same partial write on every start.
+      await clearPendingSettings()
+    }
+    // Re-read through the settings source so the pool, both catalogs and the
+    // scheduler pick the imported values up now, rather than at the next edit.
+    applyConfigFromSource()
+    ctx.logger.info?.(`dsh-workbuddy-xdpool: applied imported settings (${applied.join(', ') || 'none'})`)
+  }
+  void applyPendingTransferSettings().catch((error: unknown) => {
+    ctx.logger.warn?.('dsh-workbuddy-xdpool: could not apply imported settings', error)
+  })
+
 
   // One shim per region. Each carries its own ephemeral port and secret, and
   // each is scoped to its gateway's accounts, so the two providers are fully
@@ -1016,6 +1140,61 @@ function canonicalJson(value: unknown): string {
       const result = await seedCatalog()
       invalidateCatalog()
       return result
+    },
+    /**
+     * Build the bundle the card downloads.
+     *
+     * Read fresh on every request rather than cached: the pool rescans and the
+     * tokens refresh, so a bundle assembled at startup would hand out credentials
+     * that may already have been replaced.
+     */
+    buildTransferBundle: async () => {
+      const accounts = await core.pool.scan()
+      const settings = transferableSettings()
+      return {
+        bundle: buildBundle({
+          accounts: accounts.map(account => ({
+            id: account.id,
+            label: account.label,
+            credential: account.credential,
+          })),
+          ...settings === undefined ? {} : { settings },
+        }),
+        filename: `workbuddy-xdpool-${localDayKey()}.json`,
+      }
+    },
+    /**
+     * Write an uploaded bundle into the pool and stage its settings.
+     *
+     * Accounts are written first and the settings staged afterwards: the
+     * credentials are the part that saves the user real work, so a failure while
+     * staging settings must not roll back an import that already succeeded.
+     */
+    applyTransferBundle: async (text: string): Promise<PoolWebTransferResult> => {
+      const parsed = parseBundle(text)
+      if (!parsed.ok) throw new Error(parsed.error)
+      const { bundle } = parsed
+      const result = await writeBundleAccounts(bundle)
+      const settings = bundle.settings === undefined ? undefined : pickTransferSettings(bundle.settings)
+      const settingsKeys = settings === undefined ? [] : Object.keys(settings)
+      if (settings !== undefined && settingsKeys.length > 0) {
+        await writePendingSettings(settings)
+      }
+      // Rescan so the imported accounts are in the pool before the card polls
+      // its status document — the user just watched them arrive and a delay
+      // would read as "the import did nothing".
+      if (result.imported.length > 0) await core.pool.scan()
+      ctx.logger.info?.(
+        `dsh-workbuddy-xdpool: imported ${result.imported.length} account(s)`
+          + `${settingsKeys.length === 0 ? '' : `, staged settings: ${settingsKeys.join(', ')}`}`,
+      )
+      return {
+        ok: true,
+        imported: result.imported.map(entry => ({ id: entry.id, label: entry.label })),
+        skipped: result.skipped,
+        settings: settingsKeys,
+        exportedAt: bundle.exportedAt,
+      }
     },
   }))
   api = {

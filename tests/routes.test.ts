@@ -21,6 +21,8 @@ import {
   POOL_AUTOMATION_RUN_PATH,
   POOL_CHECKIN_PATH,
   POOL_CREDIT_RESERVE_PATH,
+  POOL_EXPORT_PATH,
+  POOL_IMPORT_PATH,
   POOL_RESCAN_PATH,
   POOL_RESET_COOLDOWN_PATH,
   POOL_STATUS_PATH,
@@ -124,9 +126,135 @@ describe('pool card route table', () => {
       POOL_ACCOUNT_DISABLE_PATH,
       POOL_AUTOMATION_RUN_PATH,
       POOL_CREDIT_RESERVE_PATH,
+      POOL_EXPORT_PATH,
+      POOL_IMPORT_PATH,
     ]) {
       expect(routes.has(path), `${path} should be registered`).toBe(true)
     }
+  })
+
+  it('serves the export bundle as a download, never as a rendered document', async () => {
+    const routes = await mount(1, {
+      buildTransferBundle: async () => ({ bundle: { format: 'x', accounts: [] }, filename: 'b.json' }),
+    })
+    const handler = routes.get(POOL_EXPORT_PATH) as (req: unknown, res: unknown) => Promise<void>
+    const headers: Record<string, string> = {}
+    const res = {
+      status: 0,
+      body: undefined as unknown,
+      writeHead(status: number, extra?: Record<string, string>) {
+        this.status = status
+        Object.assign(headers, extra ?? {})
+      },
+      end(payload: string) { this.body = payload },
+    }
+    await handler({ method: 'GET', headers: { origin: 'http://localhost:3000' }, on() {}, destroy() {} }, res)
+    expect(res.status).toBe(200)
+    // A bundle holds credentials: it must be an attachment, and it must not be
+    // storable by anything between the host and the browser.
+    expect(headers['Content-Disposition']).toContain('attachment')
+    expect(headers['Content-Disposition']).toContain('b.json')
+    expect(headers['Cache-Control']).toBe('no-store')
+    expect(JSON.parse(res.body as string)).toMatchObject({ format: 'x' })
+  })
+
+  it('answers 503 on export when the host wired no bundle builder', async () => {
+    const routes = await mount()
+    const handler = routes.get(POOL_EXPORT_PATH) as (req: unknown, res: unknown) => Promise<void>
+    const res = {
+      status: 0,
+      body: undefined as unknown,
+      writeHead(status: number) { this.status = status },
+      end(payload: string) { this.body = JSON.parse(payload) },
+    }
+    await handler({ method: 'GET', headers: { origin: 'http://localhost:3000' }, on() {}, destroy() {} }, res)
+    expect(res.status).toBe(503)
+  })
+
+  it('imports a posted bundle and reports what landed', async () => {
+    let received = ''
+    const routes = await mount(1, {
+      applyTransferBundle: async (text: string) => {
+        received = text
+        return {
+          ok: true,
+          imported: [{ id: 'a', label: 'Account A' }],
+          skipped: [],
+          settings: ['distribution'],
+          exportedAt: '2026-10-02T00:00:00.000Z',
+        }
+      },
+    })
+    const handler = routes.get(POOL_IMPORT_PATH) as (req: unknown, res: unknown) => Promise<void>
+    const payload = JSON.stringify({ format: 'bundle', version: 1, accounts: [] })
+    const res = {
+      status: 0,
+      body: undefined as unknown,
+      writeHead(status: number) { this.status = status },
+      end(body: string) { this.body = JSON.parse(body) },
+    }
+    const req = {
+      method: 'POST',
+      headers: { origin: 'http://localhost:3000', 'content-type': 'application/json' },
+      on(event: string, listener: (arg?: unknown) => void) {
+        if (event === 'data') setTimeout(() => { listener(Buffer.from(payload, 'utf8')) }, 0)
+        if (event === 'end') setTimeout(() => { listener() }, 1)
+        return req
+      },
+      destroy() {},
+    }
+    await handler(req, res)
+    expect(res.status).toBe(200)
+    // The body reaches the host VERBATIM: the bundle is a credential document,
+    // and re-encoding it could alter byte-significant token strings.
+    expect(received).toBe(payload)
+    expect(res.body).toMatchObject({ ok: true, settings: ['distribution'] })
+  })
+
+  it('answers 400 on import when the bundle is refused', async () => {
+    const routes = await mount(1, {
+      applyTransferBundle: async () => { throw new Error('not a bundle file') },
+    })
+    const handler = routes.get(POOL_IMPORT_PATH) as (req: unknown, res: unknown) => Promise<void>
+    const res = {
+      status: 0,
+      body: undefined as unknown,
+      writeHead(status: number) { this.status = status },
+      end(body: string) { this.body = JSON.parse(body) },
+    }
+    const req = {
+      method: 'POST',
+      headers: { origin: 'http://localhost:3000', 'content-type': 'application/json' },
+      on(event: string, listener: (arg?: unknown) => void) {
+        if (event === 'data') setTimeout(() => { listener(Buffer.from('{}', 'utf8')) }, 0)
+        if (event === 'end') setTimeout(() => { listener() }, 1)
+        return req
+      },
+      destroy() {},
+    }
+    await handler(req, res)
+    // 400, not 500: the user's own file is wrong, and a 500 would read as a
+    // broken plugin and hide the real cause.
+    expect(res.status).toBe(400)
+    expect((res.body as Record<string, unknown>)['error']).toContain('not a bundle file')
+  })
+
+  it('refuses an import from a non-loopback origin', async () => {
+    const routes = await mount(1, { applyTransferBundle: async () => ({ ok: true } as never) })
+    const handler = routes.get(POOL_IMPORT_PATH) as (req: unknown, res: unknown) => Promise<void>
+    const res = {
+      status: 0,
+      body: undefined as unknown,
+      writeHead(status: number) { this.status = status },
+      end(body: string) { this.body = JSON.parse(body) },
+    }
+    await handler({
+      method: 'POST',
+      headers: { origin: 'http://evil.example.com' },
+      on() {},
+      destroy() {},
+    }, res)
+    expect(res.status).toBe(403)
   })
 
   it('accepts a manual automation run and answers with the job result', async () => {

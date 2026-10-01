@@ -1071,7 +1071,16 @@ export declare function defaultDesktopAuthDirs(platform?: NodeJS.Platform, home?
  */
 export declare function parseWorkBuddyAuth(text: string, sourcePath: string, decrypt?: (field: unknown) => string): WorkBuddyCredential | undefined;
 export declare function workbuddyAccountId(credential: Pick<WorkBuddyCredential, 'uin' | 'uid' | 'nickname'>): string;
-/** Every directory the pool should scan, in probe order. */
+/**
+ * Every directory the pool should scan, in probe order.
+ *
+ * The plugin's OWN data directory is scanned alongside the desktop app's, which
+ * is what makes an imported bundle (and the CLI's `import <key>`) actually join
+ * the rotation. It is listed last so the desktop app's live sign-in and its
+ * snapshots still win the freshness comparison against a copy of the same
+ * account — an imported file is a point-in-time capture, never the session the
+ * app is currently using.
+ */
 export declare function candidateAuthDirs(env?: NodeJS.ProcessEnv): string[];
 /** How the pool chooses which account serves the next request. */
 type AccountDistribution = 'priority' | 'round-robin' | 'balanced';
@@ -1485,6 +1494,31 @@ export declare const POOL_ACCOUNT_IGNORE_PATH = "/plugins/dsh-workbuddy-xdpool/a
 export declare const POOL_AUTOMATION_RUN_PATH = "/plugins/dsh-workbuddy-xdpool/automation/run";
 /** Set or clear one account's reserved-credit floor. */
 export declare const POOL_CREDIT_RESERVE_PATH = "/plugins/dsh-workbuddy-xdpool/accounts/credit-reserve";
+/** One account an import wrote, as reported back to the card. */
+interface PoolWebTransferImported {
+  id: string;
+  label: string;
+}
+/** One account an import refused, with the reason. */
+interface PoolWebTransferSkipped {
+  label: string;
+  reason: string;
+}
+/**
+ * Result of an import, so the card can confirm what actually landed.
+ *
+ * `settings` names the settings keys the bundle carried; they are staged for the
+ * host rather than applied inline (see the host's pending-settings handoff), so
+ * the card tells the user a restart is what puts them in force.
+ */
+interface PoolWebTransferResult {
+  ok: true;
+  imported: PoolWebTransferImported[];
+  skipped: PoolWebTransferSkipped[];
+  settings: string[];
+  /** When the bundle was written on the source machine, ISO. */
+  exportedAt: string;
+}
 /** One account's row, token-free. */
 interface PoolWebAccount {
   id: string;
@@ -2775,6 +2809,222 @@ export declare function ignoreAccount(account: {
 /** Drop one account from the ignore list. Returns the resulting list. */
 export declare function unignoreAccount(accountId: string, path?: string): Promise<IgnoredAccount[]>;
 //#endregion
+//#region src/transfer.d.ts
+/**
+ * Format marker, checked on import.
+ *
+ * A bundle is a file the user may hand-edit or confuse with something else, so
+ * the first thing import does is confirm it is looking at one. Without this a
+ * JSON file of the wrong shape imports as "zero accounts" and reports success.
+ */
+export declare const BUNDLE_FORMAT = "dsh-workbuddy-xdpool-bundle";
+/** Bundle schema version. Import accepts only versions it understands. */
+export declare const BUNDLE_VERSION = 1;
+/** File-name prefix for credentials written by an import. */
+export declare const IMPORTED_FILE_PREFIX = "workbuddy-xdpool-";
+/**
+ * One account inside a bundle.
+ *
+ * `id` and `label` are for the report the user reads; the credential itself is
+ * `document`, deliberately shaped like a desktop auth file so the same parser
+ * reads it and there is no second credential format to keep in step.
+ */
+interface TransferAccount {
+  /** Pool account id, as `accounts --json` prints it. */
+  id: string;
+  /** Human label, so an import report is readable without a rescan. */
+  label: string;
+  /** Plain (decrypted) auth document, readable by {@link parseWorkBuddyAuth}. */
+  document: Record<string, unknown>;
+}
+/**
+ * The plugin settings a bundle carries.
+ *
+ * Only keys the user chose to travel: the model selection, how requests spread,
+ * which accounts are switched off, the credit floors, and the automation switch.
+ * The earnings and usage ledgers are deliberately absent — they are this
+ * machine's history, and importing yesterday's counters into a fresh install
+ * would claim rewards and traffic that never happened there.
+ */
+interface TransferSettings {
+  distribution?: string;
+  disabledAccountIds?: string[];
+  creditReserves?: Record<string, number>;
+  /**
+   * The per-region model selections and the automation block are carried as
+   * opaque values on purpose.
+   *
+   * Their real shapes live in the settings schema (`ModelSelectionConfig`,
+   * `AutomationConfig`), and restating them here would mean a second copy of
+   * each that has to be kept in step. The host writes what it holds and
+   * {@link pickTransferSettings} narrows whatever arrives from a file, which is
+   * the only place an untrusted value can enter.
+   */
+  modelSelectionCn?: unknown;
+  modelSelectionGlobal?: unknown;
+  automation?: unknown;
+}
+/** A parsed, validated bundle. */
+interface TransferBundle {
+  format: string;
+  version: number;
+  /** When the source machine wrote it, ISO. */
+  exportedAt: string;
+  /** Machine the bundle came from, for the import report. */
+  source?: {
+    platform: string;
+    host?: string;
+  };
+  accounts: TransferAccount[];
+  settings?: TransferSettings;
+}
+/**
+ * Rebuild a desktop-shaped auth document from a parsed credential.
+ *
+ * Field names and nesting match what the desktop app writes, because the
+ * receiving side parses this with the same `parseWorkBuddyAuth` the pool uses.
+ * A bespoke shape would need its own parser, and two parsers for one concept is
+ * how the import path quietly stops agreeing with the discovery path.
+ */
+export declare function credentialToDocument(credential: WorkBuddyCredential): Record<string, unknown>;
+/** Assemble a bundle from live pool accounts and the saved settings. */
+export declare function buildBundle(input: {
+  accounts: readonly {
+    id: string;
+    label: string;
+    credential: WorkBuddyCredential;
+  }[];
+  settings?: TransferSettings;
+  now?: Date;
+}): TransferBundle;
+/** Pretty-print a bundle for writing to disk. */
+export declare function serializeBundle(bundle: TransferBundle): string;
+/** Outcome of reading a bundle: the parsed value, or why it was refused. */
+type BundleParseResult = {
+  ok: true;
+  bundle: TransferBundle;
+} | {
+  ok: false;
+  error: string;
+};
+/**
+ * Validate an untrusted bundle.
+ *
+ * Every failure returns a REASON rather than an empty bundle: importing a file
+ * that turns out to be something else must not read as "0 accounts imported,
+ * done", which is indistinguishable from a successful import of an empty pool
+ * and sends the user looking for the fault in the wrong place.
+ */
+export declare function parseBundle(text: string): BundleParseResult;
+/** One account an import refused, with the reason, so the report can say why. */
+interface TransferSkip {
+  label: string;
+  reason: string;
+}
+/** What an import did, for the CLI report and the card's confirmation. */
+interface TransferApplyResult {
+  /** Accounts written to disk and readable by the pool. */
+  imported: {
+    id: string;
+    label: string;
+    file: string;
+  }[];
+  /** Accounts the bundle carried but that could not be used. */
+  skipped: TransferSkip[];
+  /** Settings keys the caller applied; empty when the bundle carried none. */
+  settingsApplied: string[];
+}
+/**
+ * Absolute path of one imported account's credential file.
+ *
+ * Named after the pool's own account id, so re-importing the same bundle
+ * overwrites the same file instead of growing a new copy each time — and so a
+ * re-import is also the way to refresh a token that has since expired.
+ *
+ * The `workbuddy-desktop.info` name is deliberately NOT reused: that name means
+ * "the app's live sign-in" to `compareFreshness`, which ranks a live file above
+ * every other credential. An imported copy claiming to be live would outrank the
+ * real session on the machine that actually has one.
+ */
+export declare function importedCredentialPath(accountId: string, dir?: string): string;
+/**
+ * Write a bundle's accounts into the plugin's own data directory.
+ *
+ * The directory is scanned by the pool alongside the desktop app's (see
+ * `candidateAuthDirs`), so a written file joins the rotation on the next scan
+ * without touching the app's own files — discovery stays read-only with respect
+ * to the desktop app, which is what keeps an import from disturbing the session
+ * the user is actually signed in with.
+ *
+ * Each document is parsed BEFORE it is written. A document that cannot produce a
+ * credential — a refresh window that already closed, a missing access token —
+ * is reported as skipped rather than written, because a file the pool cannot
+ * read is a permanent "credential file could not be read" warning on the card
+ * with nothing the user can do about it.
+ */
+export declare function writeBundleAccounts(bundle: TransferBundle, dir?: string): Promise<TransferApplyResult>;
+/** File holding settings a CLI import could not apply, for the host to pick up. */
+export declare const PENDING_SETTINGS_FILE_NAME = "pending-settings.json";
+/** Absolute path of the pending-settings handoff file. */
+export declare function pendingSettingsPath(dir?: string): string;
+/**
+ * Hand a bundle's settings to the running host.
+ *
+ * The CLI has no settings service: on this host line the plugin's settings live
+ * in the profile's patch document, which the host owns and writes. Writing that
+ * YAML from a short-lived CLI process would mean re-implementing the host's own
+ * merge rules against a file it may be rewriting at the same moment.
+ *
+ * So the CLI leaves the block here and the host applies it through the same
+ * settings path every other write uses, on its next start. The alternative —
+ * importing accounts and silently dropping the settings — leaves the user with
+ * half a transfer and no way to tell that the other half never happened.
+ */
+export declare function writePendingSettings(settings: TransferSettings, dir?: string): Promise<string>;
+/** Read the pending-settings handoff, or undefined when there is none. */
+export declare function readPendingSettings(dir?: string): Promise<TransferSettings | undefined>;
+/** Remove the pending-settings handoff once it has been applied. */
+export declare function clearPendingSettings(dir?: string): Promise<void>;
+/**
+ * The settings keys a bundle may carry, in the order the report lists them.
+ *
+ * A fixed list rather than "whatever the file holds": the block arrives from an
+ * untrusted file, and copying unknown keys into the settings document would let
+ * a hand-edited bundle write arbitrary fields into the user's config.
+ */
+export declare const TRANSFER_SETTING_KEYS: readonly ["distribution", "disabledAccountIds", "creditReserves", "modelSelectionCn", "modelSelectionGlobal", "automation"];
+/**
+ * Narrow an untrusted settings block to the keys this plugin owns.
+ *
+ * Each value is also type-checked against what its schema accepts, so a
+ * malformed field is dropped here rather than reaching the settings service and
+ * failing validation there — which would surface as "the namespace refused to
+ * register" rather than as "this one field was ignored".
+ */
+export declare function pickTransferSettings(raw: TransferSettings | Record<string, unknown>): TransferSettings;
+/** File holding the host's mirror of the transferable settings, for the CLI. */
+export declare const SETTINGS_SNAPSHOT_FILE_NAME = "settings-snapshot.json";
+/** Absolute path of the settings mirror. */
+export declare function settingsSnapshotPath(dir?: string): string;
+/**
+ * Mirror the transferable settings to a file the CLI can read.
+ *
+ * The CLI runs as its own process with no settings service, and the settings
+ * themselves live in the profile's own document — a YAML file the host owns,
+ * rewrites, and resolves through its own patch layering. Re-parsing that from
+ * the CLI would mean re-implementing the host's merge rules against a file it
+ * may be rewriting at the same moment, and getting it subtly wrong would export
+ * settings that do not match what is running.
+ *
+ * So the host, which already holds the resolved values, writes them here on
+ * every config apply. `export` then reads one small JSON file whose shape it
+ * owns. A stale mirror is not a hazard: it is rewritten whenever the settings
+ * change, which is exactly when its content would otherwise go out of date.
+ */
+export declare function writeSettingsSnapshot(settings: TransferSettings, dir?: string): Promise<void>;
+/** Read the host's settings mirror; undefined when the host never wrote one. */
+export declare function readSettingsSnapshot(dir?: string): Promise<TransferSettings | undefined>;
+//#endregion
 //#region src/web-status.d.ts
 /** Constructor dependencies — a narrow slice of the pool runtime. */
 interface PoolStatusRouteOptions {
@@ -2870,6 +3120,26 @@ interface PoolStatusRouteOptions {
       error?: string;
     }>>;
   }>;
+  /**
+   * Build the transfer bundle the card downloads.
+   *
+   * Host-supplied rather than assembled here because it needs the pool's
+   * credentials AND the settings the host owns; the route only serializes and
+   * sets the download headers. Absent without a settings service, in which case
+   * the export route answers 503 instead of handing out a bundle with half its
+   * content missing.
+   */
+  buildTransferBundle?: () => Promise<{
+    bundle: unknown;
+    filename: string;
+  }>;
+  /**
+   * Write an uploaded bundle into the pool and stage its settings.
+   *
+   * Absent on a build with no settings service: the route then answers 503
+   * rather than importing accounts whose settings would be silently dropped.
+   */
+  applyTransferBundle?: (text: string) => Promise<PoolWebTransferResult>;
 }
 /**
  * Assemble the card's status document. Per-account credits and check-in state
@@ -3087,4 +3357,4 @@ export declare function createCore(logger?: {
  */
 export declare function apply(ctx: Context, config?: Config): void;
 //#endregion
-export type { AccountStatus, AutomationLedger, AutomationRunSummary, AutomationStatus, Context, ExpertUseMode, IgnoredAccount, MarketExpert, ModelSelection, PoolStatusRouteOptions, PoolWebAccountIgnore, PoolWebCheckin, PoolWebCheckinClaim, PoolWebIgnoredAccount, PoolWebModel, PoolWebModelSelection, PoolWebStatus, PoolWebUsageTotals, SchedulerLogger, StreamUsage, TaskEventChain, TaskEventTransport, UpstreamErrorKind, UsageCounters, UsageLedger, UsageReport, UsageRow, UsageTotals, WorkBuddyAccount, WorkBuddyAdapter, WorkBuddyCredential, WorkBuddyModelInfo, WorkBuddyShim, WorkBuddyStatus };
+export type { AccountStatus, AutomationLedger, AutomationRunSummary, AutomationStatus, Context, ExpertUseMode, IgnoredAccount, MarketExpert, ModelSelection, PoolStatusRouteOptions, PoolWebAccountIgnore, PoolWebCheckin, PoolWebCheckinClaim, PoolWebIgnoredAccount, PoolWebModel, PoolWebModelSelection, PoolWebStatus, PoolWebTransferResult, PoolWebUsageTotals, SchedulerLogger, StreamUsage, TaskEventChain, TaskEventTransport, TransferAccount, TransferApplyResult, TransferBundle, TransferSettings, TransferSkip, UpstreamErrorKind, UsageCounters, UsageLedger, UsageReport, UsageRow, UsageTotals, WorkBuddyAccount, WorkBuddyAdapter, WorkBuddyCredential, WorkBuddyModelInfo, WorkBuddyShim, WorkBuddyStatus };

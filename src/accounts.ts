@@ -15,6 +15,7 @@ import { readFile, readdir } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, join, resolve } from 'node:path'
 import { regionOf, type WorkBuddyRegion } from './upstream.ts'
+import { pluginDataDir } from './ignored.ts'
 import {
   emptyLedger,
   localDayKey,
@@ -515,7 +516,16 @@ export async function primeAtRestKeys(): Promise<void> {
   await readAtRestKey().catch(() => undefined)
 }
 
-/** Every directory the pool should scan, in probe order. */
+/**
+ * Every directory the pool should scan, in probe order.
+ *
+ * The plugin's OWN data directory is scanned alongside the desktop app's, which
+ * is what makes an imported bundle (and the CLI's `import <key>`) actually join
+ * the rotation. It is listed last so the desktop app's live sign-in and its
+ * snapshots still win the freshness comparison against a copy of the same
+ * account — an imported file is a point-in-time capture, never the session the
+ * app is currently using.
+ */
 export function candidateAuthDirs(env: NodeJS.ProcessEnv = process.env): string[] {
   const dirs: string[] = []
   const override = nonEmptyEnv(env[WORKBUDDY_AUTH_FILE_ENV])
@@ -524,6 +534,7 @@ export function candidateAuthDirs(env: NodeJS.ProcessEnv = process.env): string[
     dirs.push(override.toLowerCase().endsWith('.info') ? resolve(override, '..') : override)
   }
   dirs.push(...defaultDesktopAuthDirs(process.env['DSH_TEST_PLATFORM'] as NodeJS.Platform | undefined))
+  dirs.push(pluginDataDir(env))
   return dirs
 }
 

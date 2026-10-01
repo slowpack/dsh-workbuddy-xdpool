@@ -7,10 +7,11 @@
  */
 
 import { createHash } from 'node:crypto'
-import { existsSync } from 'node:fs'
+import { existsSync, realpathSync } from 'node:fs'
 import { copyFile, mkdir, readFile, writeFile } from 'node:fs/promises'
 import { homedir, platform } from 'node:os'
 import { join, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import {
   defaultDesktopAuthDirs,
   parseWorkBuddyAuth,
@@ -21,6 +22,16 @@ import { WORKBUDDY_APP_EXECUTABLE_ENV, workbuddyAppExecutableCandidates } from '
 import { createCore } from './index.ts'
 import { ignoreAccount, readIgnoredAccounts, unignoreAccount } from './ignored.ts'
 import { formatRates, formatStatus } from './status.ts'
+import {
+  buildBundle,
+  ensureDirFor,
+  parseBundle,
+  pickTransferSettings,
+  readSettingsSnapshot,
+  serializeBundle,
+  writeBundleAccounts,
+  writePendingSettings,
+} from './transfer.ts'
 
 /** Directory holding imported account snapshots. */
 const ACCOUNT_DIR_NAME = '.workbuddy-xdpool'
@@ -67,6 +78,8 @@ function usage(): string {
     '  accounts            List discovered accounts (add --json)',
     '  import <key>        Snapshot the current desktop login as <key> (add --force)',
     '  remove <key>        Delete one imported snapshot',
+    '  export [file]       Write every account and setting to a bundle for another machine',
+    '  transfer <file>     Import a bundle written by `export` on another machine',
     '  ignore <acct>       Drop an account from the pool for good (id or label)',
     '  unignore <acct>     Put an ignored account back into the pool',
     '  ignored             List the accounts dropped from the pool (add --json)',
@@ -78,7 +91,9 @@ function usage(): string {
     '  --json              Machine-readable output',
     '  --credits           Query remaining credits (read-only; does not consume)',
     '  --rates             Show per-model credit multipliers',
-    '  --force             Overwrite an existing snapshot',
+    '  --force             Overwrite an existing snapshot or bundle',
+    '  --accounts-only     Export credentials without the settings block',
+    '  --settings-only     Export settings without any credential',
   ].join('\n')
 }
 
@@ -406,6 +421,153 @@ async function commandImport(args: string[]): Promise<number> {
   return 0
 }
 
+/**
+ * Write every pooled account and the transferable settings to one bundle file.
+ *
+ * Credentials are written DECRYPTED. The desktop app seals its tokens with a key
+ * derived from the installed build (5.6.0+, both platforms), so a verbatim copy
+ * of its files would only open on a machine running that same build — and on any
+ * other it would read as "not signed in" with no hint why. Plain values are the
+ * shape pre-5.6.0 builds write and the shape `parseWorkBuddyAuth` accepts
+ * everywhere, so the receiving machine needs no key of its own.
+ *
+ * Which also means the file IS the accounts: it is said out loud on every run
+ * rather than left for the user to discover.
+ */
+async function commandExport(args: string[]): Promise<number> {
+  const positional = args.filter(arg => !arg.startsWith('--'))
+  const force = args.includes('--force')
+  const accountsOnly = args.includes('--accounts-only')
+  const settingsOnly = args.includes('--settings-only')
+  if (accountsOnly && settingsOnly) {
+    console.error('--accounts-only and --settings-only are mutually exclusive')
+    return 2
+  }
+
+  const defaultName = `workbuddy-xdpool-${new Date().toISOString().slice(0, 10)}.json`
+  const target = resolve(positional[0] ?? join(process.cwd(), defaultName))
+
+  if (!force && existsSync(target)) {
+    console.error(`"${target}" already exists. Re-run with --force to overwrite.`)
+    return 1
+  }
+
+  const core = await cliCore()
+  const accounts = settingsOnly ? [] : await core.pool.scan()
+  if (!settingsOnly && accounts.length === 0) {
+    console.error(
+      'No WorkBuddy account discovered, so there is nothing to export.\n'
+        + 'Sign in on the WorkBuddy desktop app first, then re-run.',
+    )
+    return 1
+  }
+
+  // The settings mirror is written by the host on every config apply. Absent
+  // means the plugin has not run on this machine yet, which is reported rather
+  // than silently exported as "no settings".
+  const settings = accountsOnly ? undefined : await readSettingsSnapshot()
+  if (!accountsOnly && settings === undefined) {
+    console.log('Note: no settings mirror found (the plugin has not run here yet); exporting accounts only.')
+  }
+
+  const bundle = buildBundle({
+    accounts: accounts.map(account => ({
+      id: account.id,
+      label: account.label,
+      credential: account.credential,
+    })),
+    ...settings === undefined ? {} : { settings },
+  })
+
+  await ensureDirFor(target)
+  await writeFile(target, serializeBundle(bundle), 'utf8')
+
+  console.log(
+    `Exported ${bundle.accounts.length} account(s)`
+      + `${settings === undefined ? '' : ` and settings (${Object.keys(settings).join(', ')})`}\n`
+      + `  saved: ${target}\n`
+      + '\n'
+      + '  This file holds every account\'s tokens in the clear — anyone who reads it\n'
+      + '  holds those accounts. Move it directly to the other machine and delete it\n'
+      + '  from anywhere it was copied through.',
+  )
+  return 0
+}
+
+/**
+ * Import a bundle written by {@link commandExport} on another machine.
+ *
+ * Accounts land in the plugin's own data directory, which the pool scans
+ * alongside the desktop app's. The app's files are never touched: the session
+ * the user is actually signed in with must not be disturbed by an import.
+ *
+ * Settings are handed to the host through a small file rather than written here.
+ * The settings document belongs to the host — it is layered, validated and
+ * rewritten by it — and this process has no settings service, so a direct write
+ * would race the host and could be reverted by its next save.
+ */
+async function commandTransfer(args: string[]): Promise<number> {
+  const positional = args.filter(arg => !arg.startsWith('--'))
+  const source = positional[0]
+  if (source === undefined) {
+    console.error('usage: dsh-workbuddy-xdpool transfer <file> [--json]')
+    return 2
+  }
+  const asJson = args.includes('--json')
+
+  let text: string
+  try {
+    text = await readFile(resolve(source), 'utf8')
+  } catch (error: unknown) {
+    console.error(`Cannot read "${source}": ${error instanceof Error ? error.message : String(error)}`)
+    return 1
+  }
+
+  const parsed = parseBundle(text)
+  if (!parsed.ok) {
+    console.error(`"${source}" is not a usable bundle: ${parsed.error}`)
+    return 1
+  }
+  const { bundle } = parsed
+
+  const result = await writeBundleAccounts(bundle)
+  const settings = bundle.settings === undefined ? undefined : pickTransferSettings(bundle.settings)
+  const settingKeys = settings === undefined ? [] : Object.keys(settings)
+  let pendingPath: string | undefined
+  if (settings !== undefined && settingKeys.length > 0) {
+    pendingPath = await writePendingSettings(settings)
+  }
+
+  if (asJson) {
+    console.log(JSON.stringify({
+      ok: true,
+      source: resolve(source),
+      exportedAt: bundle.exportedAt,
+      imported: result.imported.map(entry => ({ id: entry.id, label: entry.label })),
+      skipped: result.skipped,
+      settings: settingKeys,
+    }, null, 2))
+    return result.imported.length === 0 && result.skipped.length > 0 ? 1 : 0
+  }
+
+  console.log(`Imported ${result.imported.length} account(s) from ${resolve(source)}`)
+  for (const entry of result.imported) console.log(`  + ${entry.label}`)
+  for (const entry of result.skipped) console.log(`  ! ${entry.label}: ${entry.reason}`)
+
+  if (pendingPath !== undefined) {
+    console.log(
+      `\nSettings carried by the bundle (${settingKeys.join(', ')}) were staged for the host.\n`
+        + '  Restart DSH to apply them; they are written through the same settings path\n'
+        + '  the card uses, so the model selection and automation survive the restart.',
+    )
+  }
+
+  if (result.imported.length > 0) {
+    console.log('\nRun `accounts` to confirm, or restart DSH to put them into rotation.')
+  }
+  return result.imported.length === 0 && result.skipped.length > 0 ? 1 : 0
+}
+
 async function commandRemove(args: string[]): Promise<number> {
   const key = args.filter(arg => !arg.startsWith('--'))[0]
   if (key === undefined) {
@@ -589,6 +751,10 @@ export async function main(argv: string[]): Promise<number> {
       return commandAccounts(rest)
     case 'import':
       return commandImport(rest)
+    case 'export':
+      return commandExport(rest)
+    case 'transfer':
+      return commandTransfer(rest)
     case 'remove':
       return commandRemove(rest)
     case 'ignore':
@@ -611,12 +777,41 @@ export async function main(argv: string[]): Promise<number> {
   }
 }
 
-main(process.argv.slice(2)).then(
-  code => process.exit(code),
-  (error: unknown) => {
-    console.error(error)
-    process.exit(1)
-  },
-)
+/**
+ * Run only when this module IS the process entry point.
+ *
+ * `package.json` declares `lib/bin.js` as the `dsh-workbuddy-xdpool` binary, so
+ * the normal path is "node runs this file" and the guard is true. It exists so
+ * the command table can also be IMPORTED — a test driving `main()` directly is
+ * testing the real commands, whereas spawning a child process would test the
+ * spawn — and without it the import would immediately execute a command with the
+ * test runner's own argv and call `process.exit` on it.
+ *
+ * The comparison resolves symlinks on both sides because the binary is commonly
+ * reached through one: this profile installs the plugin as a `link:` dependency,
+ * and `process.argv[1]` then holds the real path while `import.meta.url` holds
+ * the link.
+ */
+function isProcessEntryPoint(): boolean {
+  const entry = process.argv[1]
+  if (entry === undefined || entry === '') return false
+  try {
+    return realpathSync(entry) === realpathSync(fileURLToPath(import.meta.url))
+  } catch {
+    // Either path is unresolvable (a bundler-provided URL, a deleted file):
+    // fall back to the raw comparison rather than silently skipping the command.
+    return resolve(entry) === fileURLToPath(import.meta.url)
+  }
+}
+
+if (isProcessEntryPoint()) {
+  main(process.argv.slice(2)).then(
+    code => process.exit(code),
+    (error: unknown) => {
+      console.error(error)
+      process.exit(1)
+    },
+  )
+}
 
 export { writeFile }

@@ -149,6 +149,8 @@ dsh plugin --profile desktop exec dsh-workbuddy-xdpool reset     # 立刻清掉�
 dsh plugin --profile desktop exec dsh-workbuddy-xdpool checkin   # 查每个账号今天签到了没（--json 机器可读）
 dsh plugin --profile desktop exec dsh-workbuddy-xdpool checkin all
                                                                  # 领掉所有账号今天的签到奖励；也可以只传一个账号标签领单个
+dsh plugin --profile desktop exec dsh-workbuddy-xdpool export    # 导出账号 + 设置，带到另一台机器（--accounts-only / --settings-only）
+dsh plugin --profile desktop exec dsh-workbuddy-xdpool transfer  # 在另一台机器导入这个文件
 dsh plugin --profile desktop exec dsh-workbuddy-xdpool login     # 教你怎么在桌面再加一个号进池
 ```
 
@@ -167,6 +169,31 @@ dsh plugin --profile desktop exec dsh-workbuddy-xdpool remove myKey
 ```
 
 导入的快照以 key 的 **MD5 前 8 位**命名，放在 `~/.dsh/.workbuddy-xdpool/`（key 本身记在文件里），中文、带 `/`、带空格的 key 都安全。长期使用靠 refresh token 自动续期；失效了就回桌面重新登录，再 `import <key> --force` 覆盖。
+
+## 换机器：导出 / 导入
+
+在另一台电脑上不想一个个重新扫码登录，就把这台机器的账号和设置打包带过去。
+
+**卡片上**：XD Pool 页右上角「导出」下载一个文件，「导入」选那个文件。
+
+**命令行**：
+
+```sh
+dsh plugin --profile desktop exec dsh-workbuddy-xdpool export ./pool.json   # 导出
+dsh plugin --profile desktop exec dsh-workbuddy-xdpool transfer ./pool.json # 在另一台机器导入
+```
+
+导出内容 = **每个账号的令牌 + 插件设置**（模型启用列表、上下文上限、分发方式、积分保留、自动化开关）。导入后重启 DSH，账号进池、设置生效。
+
+**导出文件是明文的**——里面就是每个账号的令牌，等同于一份密码清单。直接拷到目标机器，别经过网盘、聊天工具或邮件；用完删掉。
+
+几个细节：
+
+- **令牌导出时是解密后的明文**。桌面 App 从 5.6.0 起把令牌加密存盘，密钥跟本机安装的版本绑定；原样拷贝的文件换台机器打不开，会表现成「没登录」。明文则哪台机器都能读。
+- **导入只写插件自己的目录**（`~/.dsh/.workbuddy-xdpool/`），不动桌面 App 的任何文件——正在用的那个登录态不会被搅乱。
+- **同一账号以桌面 App 的实时登录为准**。导入的是某一刻的快照，不会盖掉本机真正在用的会话。
+- 令牌失效了就重新导一次；或者在那台机器上重新登录该账号。
+- `--accounts-only` 只导账号，`--settings-only` 只导设置。
 
 ## 配置
 
@@ -192,7 +219,8 @@ workbuddy-xdpool:
   - `scheduler.ts` —— 积分自动化的调度器：按本地时点跑五个任务（签到 / 上报 / 任务 / 连登 / 旅行），每日收益账本落盘，手动「立即运行」走的是同一套逻辑。
   - `task-events.ts` —— 13 条任务事件链的构造。每条链都是纯数据，外加它该走哪个指纹通道（桌面 / 网页）；需要真实会话的任务（技能、专家）在这里先开一次真对话，拿到服务端 id。
   - `catalog.ts` / `upstream.ts` —— 上游模型目录（含每模型积分倍率、免费 / 图片能力标签）、积分查询、签到、自动化各接口的上游客户端（按凭据域名自动切国内外）。
-  - `web-status.ts` / `status-paths.ts` —— 卡片读的同源状态文档与路由。写操作按「POST + 回环来源 + 显式 accountId」把关。
+  - `web-status.ts` / `status-paths.ts` —— 卡片读的同源状态文档与路由。写操作按「POST + 回环来源 + 显式 accountId」把关；导出 / 导入两条路由另算，导入按原样收下整个 bundle 文件。
+  - `transfer.ts` —— 换机器用的账号 + 设置打包：bundle 的构造、校验、落盘，以及给宿主的设置交接文件。令牌在这一步**解密后写成明文**，因为桌面 App 的加密密钥跟着本机安装的版本走，原样拷贝换台机器读不出来。
   - `bin.ts` —— 上面那套 CLI。
 - **客户端**（`src/client/`，浏览器卡片，经 `dsh.client` 由宿主加载）
   折叠卡片外壳沿用宿主内置卡的 `dsm-plugin-card*` 样式语言（`--dsw-alias-*` 主题变量），内容类名统一 `dsm-workbuddy-xdpool-*` 前缀，不污染宿主其它卡片；文案命名空间 `settings.workbuddy-xdpool`。
@@ -201,7 +229,9 @@ workbuddy-xdpool:
 
 ## 已知限制
 
-- **只能用本机桌面 App 里的账号**：池不会、也没法替你发起 WorkBuddy 的登录或扫码（token 由 WorkBuddy 桌面 App 自己的腾讯 SSO 铸造并和设备绑定）。加号 = 在桌面 App 里登录 / 切换，XD Pool 自动吸收。
+- **只能用本机桌面 App 里的账号**：池不会、也没法替你发起 WorkBuddy 的登录或扫码（token 由 WorkBuddy 桌面 App 自己的腾讯 SSO 铸造并和设备绑定）。加号 = 在桌面 App 里登录 / 切换，XD Pool 自动吸收。换机器请用「导出 / 导入」，别去拷桌面 App 的文件——那些文件是加密的，换台机器读不出来。
+
+- **导出文件是明文的**：导出为了跨机器可用，写的是解密后的令牌。这个文件等同于密码清单，传输和存放都要当密码对待。
 
 - **自动化里有几个任务刻意没做**
   - `Expert_Philanthropy`（公益专家）：需要真捐钱，绕不过去。

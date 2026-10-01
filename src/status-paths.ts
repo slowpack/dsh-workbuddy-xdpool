@@ -49,6 +49,52 @@ export const POOL_AUTOMATION_RUN_PATH = '/plugins/dsh-workbuddy-xdpool/automatio
 /** Set or clear one account's reserved-credit floor. */
 export const POOL_CREDIT_RESERVE_PATH = '/plugins/dsh-workbuddy-xdpool/accounts/credit-reserve'
 
+/**
+ * Download every account and setting as one transfer bundle.
+ *
+ * A GET so the browser saves it as a file; the card turns the response into a
+ * download rather than rendering it.
+ */
+export const POOL_EXPORT_PATH = '/plugins/dsh-workbuddy-xdpool/transfer/export'
+
+/**
+ * Import a bundle uploaded from another machine.
+ *
+ * POST with the bundle as the request body. Its own route rather than a field on
+ * the settings save, because the payload is a whole credential set: it must be
+ * readable in isolation, and it must never be reachable through a path that also
+ * writes ordinary settings.
+ */
+export const POOL_IMPORT_PATH = '/plugins/dsh-workbuddy-xdpool/transfer/import'
+
+/** One account an import wrote, as reported back to the card. */
+export interface PoolWebTransferImported {
+  id: string
+  label: string
+}
+
+/** One account an import refused, with the reason. */
+export interface PoolWebTransferSkipped {
+  label: string
+  reason: string
+}
+
+/**
+ * Result of an import, so the card can confirm what actually landed.
+ *
+ * `settings` names the settings keys the bundle carried; they are staged for the
+ * host rather than applied inline (see the host's pending-settings handoff), so
+ * the card tells the user a restart is what puts them in force.
+ */
+export interface PoolWebTransferResult {
+  ok: true
+  imported: PoolWebTransferImported[]
+  skipped: PoolWebTransferSkipped[]
+  settings: string[]
+  /** When the bundle was written on the source machine, ISO. */
+  exportedAt: string
+}
+
 /** Body of the reserve route: exactly one account per request. */
 export interface PoolWebCreditReserve {
   /** Pool account id, as reported in `PoolWebAccount.id`. */

@@ -34,6 +34,8 @@ import {
   POOL_CATALOG_REFRESH_PATH,
   POOL_CREDIT_RESERVE_PATH,
   POOL_CHECKIN_PATH,
+  POOL_EXPORT_PATH,
+  POOL_IMPORT_PATH,
   POOL_MODELS_SAVE_PATH,
   POOL_RESET_COOLDOWN_PATH,
   POOL_RESCAN_PATH,
@@ -51,6 +53,7 @@ import {
   type PoolWebIgnoredAccount,
   type PoolWebCatalogSource,
   type PoolRegion,
+  type PoolWebTransferResult,
 } from './status-paths.ts'
 
 export { POOL_ACCOUNT_DISABLE_PATH, POOL_CHECKIN_PATH, POOL_MODELS_SAVE_PATH, POOL_RESET_COOLDOWN_PATH, POOL_RESCAN_PATH, POOL_STATUS_PATH }
@@ -143,6 +146,23 @@ export interface PoolStatusRouteOptions {
   refreshCatalog?: () => Promise<{
     regions: Readonly<Record<PoolRegion, { source: PoolWebCatalogSource; models: number; error?: string }>>
   }>
+  /**
+   * Build the transfer bundle the card downloads.
+   *
+   * Host-supplied rather than assembled here because it needs the pool's
+   * credentials AND the settings the host owns; the route only serializes and
+   * sets the download headers. Absent without a settings service, in which case
+   * the export route answers 503 instead of handing out a bundle with half its
+   * content missing.
+   */
+  buildTransferBundle?: () => Promise<{ bundle: unknown; filename: string }>
+  /**
+   * Write an uploaded bundle into the pool and stage its settings.
+   *
+   * Absent on a build with no settings service: the route then answers 503
+   * rather than importing accounts whose settings would be silently dropped.
+   */
+  applyTransferBundle?: (text: string) => Promise<PoolWebTransferResult>
 }
 
 /** Redact token-like content before it crosses to the browser. */
@@ -212,6 +232,36 @@ function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
         reject(new Error('invalid JSON body'))
       }
     })
+    req.on('error', reject)
+  })
+}
+
+/**
+ * Read a request body as raw text, for the transfer import.
+ *
+ * Separate from {@link readJsonBody} for its LIMIT, not its parsing: a bundle
+ * carries a whole credential set — five accounts already run to tens of
+ * kilobytes and each token is over a kilobyte — so the 64KB cap that keeps a
+ * settings POST bounded would reject a legitimate import.
+ *
+ * Still capped, because the body arrives from a browser: an unbounded read would
+ * let one request pin the host's memory.
+ */
+function readTextBody(req: IncomingMessage): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = []
+    let size = 0
+    const LIMIT = 8 * 1024 * 1024
+    req.on('data', (chunk: Buffer) => {
+      size += chunk.length
+      if (size > LIMIT) {
+        reject(new Error('bundle is larger than 8 MB; is this the right file?'))
+        req.destroy()
+        return
+      }
+      chunks.push(chunk)
+    })
+    req.on('end', () => { resolve(Buffer.concat(chunks).toString('utf8').trim()) })
     req.on('error', reject)
   })
 }
@@ -838,7 +888,72 @@ export function registerPoolStatusRoute(ctx: Context, deps: PoolStatusRouteOptio
       },
     })
 
+    /**
+     * Hand the browser a transfer bundle as a file download.
+     *
+     * The bundle holds every account's tokens in the clear — that is the user's
+     * chosen format — so this route is the one place a credential set crosses to
+     * the browser. GET, loopback origin only, and the response is marked
+     * `no-store` so a copy cannot linger in an intermediate cache.
+     */
+    const disposeExport = ctx.webServer.register({
+      kind: 'exact',
+      path: POOL_EXPORT_PATH,
+      handler: async (req: IncomingMessage, res: ServerResponse) => {
+        if (req.method !== 'GET') return json(res, 405, { error: 'method not allowed' })
+        if (!loopbackOrigin(req)) return json(res, 403, { error: 'origin-not-trusted' })
+        if (deps.buildTransferBundle === undefined) {
+          return json(res, 503, { error: 'transfer is not available in this build' })
+        }
+        try {
+          const { bundle, filename } = await deps.buildTransferBundle()
+          const payload = JSON.stringify(bundle, null, 2)
+          res.writeHead(200, {
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(payload),
+            'Content-Disposition': `attachment; filename="${filename}"`,
+            'Cache-Control': 'no-store',
+          })
+          res.end(payload)
+        } catch (error: unknown) {
+          json(res, 500, { error: safeMessage(error) })
+        }
+      },
+    })
+
+    /**
+     * Import an uploaded bundle.
+     *
+     * The body is the bundle document itself rather than a JSON envelope around
+     * it, so the file the user picked can be sent unchanged — re-wrapping it
+     * would mean the browser had to parse credentials it has no business
+     * handling.
+     */
+    const disposeImport = ctx.webServer.register({
+      kind: 'exact',
+      path: POOL_IMPORT_PATH,
+      handler: async (req: IncomingMessage, res: ServerResponse) => {
+        if (req.method !== 'POST') return json(res, 405, { error: 'method not allowed' })
+        if (!loopbackOrigin(req)) return json(res, 403, { error: 'origin-not-trusted' })
+        if (deps.applyTransferBundle === undefined) {
+          return json(res, 503, { error: 'transfer is not available in this build' })
+        }
+        try {
+          const text = await readTextBody(req)
+          if (text === '') return json(res, 400, { error: 'empty request body' })
+          const result = await deps.applyTransferBundle(text)
+          json(res, 200, result)
+        } catch (error: unknown) {
+          // A refused bundle is the user's own file being wrong, which is a 400:
+          // a 500 here would read as "the plugin broke" and hide the real cause.
+          json(res, 400, { error: safeMessage(error) })
+        }
+      },
+    })
+
     return () => {
+      disposeImport()
+      disposeExport()
       disposeAutomationRun()
       disposeCreditReserve()
       disposeAccountIgnore()

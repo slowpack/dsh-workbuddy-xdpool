@@ -29,6 +29,8 @@ import {
   POOL_CATALOG_REFRESH_PATH,
   POOL_CREDIT_RESERVE_PATH,
   POOL_CHECKIN_PATH,
+  POOL_EXPORT_PATH,
+  POOL_IMPORT_PATH,
   POOL_RESET_COOLDOWN_PATH,
   POOL_RESCAN_PATH,
   POOL_STATUS_PATH,
@@ -418,6 +420,10 @@ export function PoolCard({ t, settingsScope }: PoolCardProps) {
   const [howToOpen, setHowToOpen] = useState(false)
   /** Automation schedule dialog. */
   const [scheduleOpen, setScheduleOpen] = useState(false)
+  /** Transfer (export / import) in flight, so both buttons lock together. */
+  const [transferBusy, setTransferBusy] = useState<'export' | 'import' | undefined>(undefined)
+  /** Hidden file input the Import button clicks. */
+  const importInputRef = useRef<HTMLInputElement | null>(null)
   /**
    * Draft model selection. `undefined` means "no local edits"; once a checkbox
    * is touched the draft takes over and is what the Save button posts.
@@ -574,6 +580,100 @@ export function PoolCard({ t, settingsScope }: PoolCardProps) {
       if (mounted.current) setError(cause instanceof Error ? cause.message : String(cause))
     } finally {
       if (mounted.current) setCooldownBusy(false)
+    }
+  }
+
+  /**
+   * Download every account and setting as one bundle file.
+   *
+   * The response is read as a Blob and saved through an object URL rather than
+   * navigated to: the route needs the same-origin credentials the fetch already
+   * carries, and a bare link would open the JSON in a tab instead of saving it —
+   * showing the user a wall of tokens.
+   */
+  const exportBundle = async (): Promise<void> => {
+    setTransferBusy('export')
+    setFlash(undefined)
+    setError(undefined)
+    try {
+      const response = await fetch(POOL_EXPORT_PATH, {
+        headers: { accept: 'application/json' }, credentials: 'same-origin',
+      })
+      if (!response.ok) {
+        const body = await response.json().catch(() => undefined) as { error?: string } | undefined
+        throw new Error(body?.error ?? `HTTP ${response.status}`)
+      }
+      const blob = await response.blob()
+      // Filename from the header when the host set one, so the date on the file
+      // is the host's (the machine that owns the accounts) rather than the
+      // browser's clock, which may sit in another timezone.
+      const disposition = response.headers.get('content-disposition') ?? ''
+      const named = /filename="([^"]+)"/u.exec(disposition)?.[1]
+      const url = URL.createObjectURL(blob)
+      const link = document.createElement('a')
+      link.href = url
+      link.download = named ?? `workbuddy-xdpool-${new Date().toISOString().slice(0, 10)}.json`
+      document.body.appendChild(link)
+      link.click()
+      link.remove()
+      URL.revokeObjectURL(url)
+      if (mounted.current) setFlash(t?.('row.transferExported') ?? '')
+    } catch (cause: unknown) {
+      if (mounted.current) setError(cause instanceof Error ? cause.message : String(cause))
+    } finally {
+      if (mounted.current) setTransferBusy(undefined)
+    }
+  }
+
+  /**
+   * Import a bundle the user picked from disk.
+   *
+   * The file is sent as the raw request body, unchanged: the browser has no
+   * reason to parse a credential set, and re-encoding it would risk altering
+   * token strings that are byte-significant.
+   */
+  const importBundle = async (file: File): Promise<void> => {
+    setTransferBusy('import')
+    setFlash(undefined)
+    setError(undefined)
+    try {
+      const text = await file.text()
+      const response = await fetch(POOL_IMPORT_PATH, {
+        method: 'POST',
+        headers: { accept: 'application/json', 'content-type': 'application/json' },
+        credentials: 'same-origin',
+        body: text,
+      })
+      const body = await response.json().catch(() => undefined) as
+        | { imported?: { label?: string }[]; skipped?: { label?: string; reason?: string }[]
+            settings?: string[]; error?: string }
+        | undefined
+      if (!response.ok) throw new Error(body?.error ?? `HTTP ${response.status}`)
+      // Both regions refresh: a bundle can carry accounts for either gateway,
+      // and the user should not have to switch tabs to see what arrived.
+      await Promise.all(POOL_REGIONS.map(region => refresh(region)))
+      if (!mounted.current) return
+      const imported = body?.imported?.length ?? 0
+      const skipped = body?.skipped?.length ?? 0
+      const settings = body?.settings ?? []
+      const parts = [t?.('row.transferImported', { count: imported }) ?? `${imported} account(s) imported`]
+      if (skipped > 0) {
+        parts.push(t?.('row.transferSkipped', { count: skipped }) ?? `${skipped} skipped`)
+      }
+      if (settings.length > 0) {
+        parts.push(t?.('row.transferSettingsStaged', { keys: settings.join(', ') })
+          ?? `settings staged (${settings.join(', ')}); restart DSH to apply`)
+      }
+      setFlash(parts.join(' · '))
+    } catch (cause: unknown) {
+      if (mounted.current) setError(cause instanceof Error ? cause.message : String(cause))
+    } finally {
+      if (mounted.current) {
+        setTransferBusy(undefined)
+        // Cleared so picking the SAME file again still fires a change event —
+        // otherwise a second import of the same bundle looks like a dead button.
+        if (importInputRef.current !== null) importInputRef.current.value = ''
+      }
     }
   }
 
@@ -1034,6 +1134,44 @@ export function PoolCard({ t, settingsScope }: PoolCardProps) {
           <p className="dsm-workbuddy-xdpool-head-desc">{description}</p>
         </span>
         <div className="dsm-workbuddy-xdpool-head-actions">
+          {/* Transfer: the two actions a second machine needs. Both are locked
+              while either runs, because an import rewrites the very account
+              list an export in flight is reading. */}
+          <button
+            type="button"
+            className="dsm-btn dsm-btn-outline"
+            disabled={transferBusy !== undefined}
+            title={t?.('row.transferExportHint') ?? undefined}
+            onClick={() => { void exportBundle() }}
+          >
+            {transferBusy === 'export'
+              ? (t?.('row.transferExporting') ?? 'Exporting…')
+              : (t?.('row.transferExport') ?? 'Export')}
+          </button>
+          <button
+            type="button"
+            className="dsm-btn dsm-btn-outline"
+            disabled={transferBusy !== undefined}
+            title={t?.('row.transferImportHint') ?? undefined}
+            onClick={() => { importInputRef.current?.click() }}
+          >
+            {transferBusy === 'import'
+              ? (t?.('row.transferImporting') ?? 'Importing…')
+              : (t?.('row.transferImport') ?? 'Import')}
+          </button>
+          {/* The picker itself stays out of the layout: the button above is the
+              only thing the user should see, and a bare file input cannot be
+              styled to match the rest of the card. */}
+          <input
+            ref={importInputRef}
+            type="file"
+            accept="application/json,.json"
+            style={{ display: 'none' }}
+            onChange={(event) => {
+              const file = event.target.files?.[0]
+              if (file !== undefined) void importBundle(file)
+            }}
+          />
           {cooling > 0
             ? <button
                 type="button"
