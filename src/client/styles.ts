@@ -98,6 +98,50 @@ export const POOL_CARD_CSS = `
  */
 .dsm-workbuddy-xdpool-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:12px;align-items:start}
 @media (max-width:880px){.dsm-workbuddy-xdpool-grid{grid-template-columns:minmax(0,1fr)}}
+/* Model directory list. */
+.dsm-workbuddy-xdpool-models{gap:10px}
+.dsm-workbuddy-xdpool-models-head{display:flex;align-items:center;justify-content:space-between;gap:12px}
+.dsm-workbuddy-xdpool-models-title{margin:0;color:var(--dsw-alias-label-primary,#e6e6e6);font-size:14px;font-weight:600;line-height:20px}
+.dsm-workbuddy-xdpool-models-summary{margin:2px 0 0;color:var(--dsw-alias-label-tertiary,#999);font-size:12px;line-height:18px}
+.dsm-workbuddy-xdpool-model-list{display:flex;flex-direction:column;border:1px solid var(--dsw-alias-border-l2,#36373b);border-radius:10px;overflow:hidden}
+.dsm-workbuddy-xdpool-model{display:grid;grid-template-columns:minmax(0,1fr);gap:7px;padding:10px 12px;background:var(--dsw-alias-bg-layer-2,#232529);transition:opacity .16s}
+.dsm-workbuddy-xdpool-model+.dsm-workbuddy-xdpool-model{border-top:1px solid var(--dsw-alias-border-l2,#36373b)}
+.dsm-workbuddy-xdpool-model-head{display:flex;align-items:center;justify-content:space-between;gap:12px;min-width:0}
+.dsm-workbuddy-xdpool-model-copy{display:flex;align-items:baseline;gap:8px;min-width:0;flex-wrap:wrap}
+.dsm-workbuddy-xdpool-model-name{display:inline-flex;align-items:baseline;gap:7px;color:var(--dsw-alias-label-primary,#e6e6e6);font-size:13px;font-weight:500;line-height:19px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dsm-workbuddy-xdpool-model-name-rate{color:var(--dsw-alias-label-tertiary,#999);font-size:11px;font-weight:400;line-height:16px;flex:none}
+.dsm-workbuddy-xdpool-model-id{color:var(--dsw-alias-label-tertiary,#999);font-size:11px;line-height:16px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dsm-workbuddy-xdpool-model-meta{display:flex;align-items:center;gap:8px;flex-wrap:wrap;color:var(--dsw-alias-label-tertiary,#999);font-size:11px;line-height:16px}
+.dsm-workbuddy-xdpool-model-meta-tag{padding:1px 8px;border-radius:999px;font-size:11px;line-height:16px;background:rgba(174,179,187,.11);color:var(--dsw-alias-label-secondary,#c6c9d0)}
+/* "free from HH:00": quieter than the badge on purpose — the model costs
+   credits right now, so it must not read as a promo the user can spend against. */
+.dsm-workbuddy-xdpool-model-meta-later{padding:1px 8px;border-radius:999px;font-size:11px;line-height:16px;border:1px dashed color-mix(in oklab, var(--dsw-alias-label-dimmed,#9aa0a8) 55%, transparent);color:var(--dsw-alias-label-tertiary,#9aa0a8)}
+/* "活动至 10-31": the campaign's end date. Muted — it is context for planning,
+   not a claim about the current price. */
+.dsm-workbuddy-xdpool-model-meta-promo{color:var(--dsw-alias-label-tertiary,#9aa0a8);font-size:11px;line-height:16px;opacity:.85}
+/* Unreadable credential files: a warning tint, since it explains a smaller pool
+   and "encrypted" is actionable (start the app once). */
+.dsm-workbuddy-xdpool-skipped{margin:6px 0 0;padding:7px 10px;border-radius:8px;background:var(--dsw-alias-state-warning-subtle,rgba(217,119,6,.12));display:flex;flex-direction:column;gap:3px}
+.dsm-workbuddy-xdpool-skipped-summary{margin:0;font-size:12px;line-height:18px;font-weight:600;color:var(--dsw-alias-state-warning-primary,#d97706)}
+.dsm-workbuddy-xdpool-skipped-row{margin:0;display:flex;gap:8px;align-items:baseline;font-size:11px;line-height:16px;flex-wrap:wrap}
+.dsm-workbuddy-xdpool-skipped-file{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:var(--dsw-alias-label-secondary,#c6c9d0);max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dsm-workbuddy-xdpool-skipped-reason{color:var(--dsw-alias-label-tertiary,#9aa0a8)}
+.dsm-workbuddy-xdpool-model-cap{color:var(--dsw-alias-label-tertiary,#999);font-size:11px;line-height:16px;font-variant-numeric:tabular-nums}
+/* Model row: checkbox + image toggle + context-budget radios. */
+.dsm-workbuddy-xdpool-model-off{opacity:.55}
+.dsm-workbuddy-xdpool-model-check{display:flex;align-items:center;gap:8px;min-width:0;flex:1;cursor:pointer}
+.dsm-workbuddy-xdpool-model-check input{margin:0;accent-color:var(--dsw-alias-brand-primary,#5686fe);flex:none}
+.dsm-workbuddy-xdpool-model-controls{display:flex;align-items:center;gap:10px;flex:none;flex-wrap:wrap;justify-content:flex-end}
+.dsm-workbuddy-xdpool-model-image{display:inline-flex;align-items:center;gap:5px;flex:none;cursor:pointer;color:var(--dsw-alias-label-secondary,#c6c9d0);font-size:11px;line-height:16px}
+.dsm-workbuddy-xdpool-model-image input{margin:0;accent-color:var(--dsw-alias-brand-primary,#5686fe)}
+.dsm-workbuddy-xdpool-model-budget{display:flex;align-items:center;gap:9px;flex:none;margin:0;padding:0;border:0;color:var(--dsw-alias-label-secondary,#c6c9d0);font-size:11px;line-height:16px}
+.dsm-workbuddy-xdpool-model-budget label{display:inline-flex;align-items:center;gap:4px;cursor:pointer}
+.dsm-workbuddy-xdpool-model-budget input{margin:0;accent-color:var(--dsw-alias-brand-primary,#5686fe)}
+.dsm-workbuddy-xdpool-models-heading{display:flex;flex-direction:column;gap:2px;min-width:0}
+.dsm-workbuddy-xdpool-models-actions{display:flex;align-items:center;gap:8px;flex:none}
+/* "Built-in list (offline)" chip: a warning tint, since the user is looking at
+   a SHORTER roster than the gateway offers and may wonder where models went. */
+.dsm-workbuddy-xdpool-catalog-offline{flex:none;padding:2px 9px;border-radius:999px;font-size:11px;line-height:17px;font-weight:600;background:var(--dsw-alias-state-warning-subtle,rgba(217,119,6,.15));color:var(--dsw-alias-state-warning-primary,#d97706);white-space:nowrap}
 
 .dsm-workbuddy-xdpool-col{flex-direction:column;display:flex;min-width:0}
 .dsm-workbuddy-xdpool-col-head{align-items:center;gap:8px;padding:9px 12px;border-bottom:1px solid color-mix(in oklab, var(--dsw-alias-border-l2,#3a3d45) 55%, transparent);display:flex}

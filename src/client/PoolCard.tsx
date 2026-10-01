@@ -45,6 +45,7 @@ import {
 import { DEFAULT_AUTOMATION_HOURS } from '../status-paths.ts'
 import { POOL_PLUGIN_ICON } from './icon.ts'
 import { POOL_CARD_CSS } from './styles.ts'
+import { isFreeNow, promoStatusFor } from '../promo.ts'
 import type { WorkBuddyPoolSettingsKey } from './locales.ts'
 
 /** Localized copy injected by the browser-plugin registration. */
@@ -333,13 +334,30 @@ function isExpiringSoon(pack: PoolWebCreditPackage): boolean {
 /**
  * The promo badge for one model, or undefined when it has none.
  *
- * `free` is read off the CREDIT MULTIPLIER, not off a tag. Neither gateway ever
- * sends a literal `free` tag: the global roster marks its zero-cost models as
- * `credits: "x0.00"`, so waiting for a tag meant the badge NEVER appeared.
- * An explicit free-ish tag still wins when present.
+ * Two sources, because the gateway models one of them and not the other:
+ *
+ *  - `free` comes from the CREDIT MULTIPLIER. Neither gateway ever sends a
+ *    literal `free` tag, but it does price its free models at `credits: "x0.00"`
+ *    (CN `hy3`), so the multiplier is the honest signal.
+ *  - the NIGHT window comes from {@link promoStatusFor}, because the gateway
+ *    charges `x0.29` for `hy4-preview` around the clock and has no field for a
+ *    time-of-day rule. See that module for why the 14-day newcomer allowance is
+ *    deliberately not modelled.
+ *
+ * `region` is threaded through because the campaigns are REGIONAL: the
+ * Hy3 / Hy4-preview extension is a domestic promotion, so a global roster must
+ * not pick up a discount that gateway does not offer.
  */
-function tagFor(model: PoolWebModel): 'free' | 'limited' | 'night' | undefined {
+function tagFor(
+  model: PoolWebModel,
+  now: Date,
+  region: 'cn' | 'global',
+): 'free' | 'limited' | 'night' | undefined {
   const tags = model.tags ?? []
+  const promo = promoStatusFor(model, now, region)
+  // A currently-active window outranks a bare multiplier: "free until 08:00" is
+  // the more useful fact, and it is the one that expires.
+  if (promo?.kind === 'night') return 'night'
   if (tags.includes('free') || model.multiplier === 0) return 'free'
   if (tags.includes('limited-free')) return 'limited'
   if (tags.includes('night-discount')) return 'night'
@@ -676,6 +694,17 @@ export function PoolCard({ t, settingsScope }: PoolCardProps) {
    */
   const enabledModels = (status?.models ?? [])
     .filter(model => (modelDraft[model.id] ?? { enabled: model.enabled }).enabled)
+  /**
+   * One clock reading per render, shared by the sort and every row.
+   *
+   * Taken once so the list cannot disagree with itself: calling `new Date()`
+   * per row would let a model be "free" for the badge and "not free" for the
+   * sort if the window boundary happened to fall between two rows.
+   *
+   * A promotion boundary is not a re-render trigger — the card refreshes on its
+   * own poll, which is frequent enough for a badge that changes twice a day.
+   */
+  const now = new Date()
 
   const toggleModel = (id: string): void => {
     if (status === undefined) return
@@ -1327,6 +1356,8 @@ export function PoolCard({ t, settingsScope }: PoolCardProps) {
                       <ModelLine
                         key={model.id}
                         model={model}
+                        region={activeRegion}
+                        now={now}
                         t={t}
                         draft={modelDraft[model.id] ?? { enabled: model.enabled, images: model.supportsImages }}
                       />
@@ -1472,10 +1503,19 @@ export function PoolCard({ t, settingsScope }: PoolCardProps) {
             </>}
           >
             <div className="dsm-workbuddy-xdpool-sec">
-              {status.models.map(model => (
+              {/* Free models first, so "what costs me nothing right now" is the
+                  first thing the eye lands on. The sort is STABLE within each
+                  group, so the gateway's own ordering survives inside the free
+                  and paid blocks alike. Only CURRENTLY-free models float up: a
+                  model whose night window is closed still costs credits, and
+                  promoting it would misrepresent the list. */}
+              {[...status.models]
+                .sort((a, b) => Number(isFreeNow(b, now, activeRegion)) - Number(isFreeNow(a, now, activeRegion)))
+                .map(model => (
                 <ModelRow
                   key={model.id}
                   model={model}
+                  region={activeRegion}
                   t={t}
                   draft={modelDraft[model.id] ?? { enabled: model.enabled, images: model.supportsImages }}
                   editable={modelsEditable}
@@ -1758,14 +1798,18 @@ function AccountRow({
  */
 function ModelLine({
   model,
+  region,
+  now,
   t,
   draft,
 }: {
   model: PoolWebModel
+  region: 'cn' | 'global'
+  now: Date
   t?: PoolCardProps['t']
   draft: ModelDraftEntry
 }) {
-  const tag = tagFor(model)
+  const tag = tagFor(model, now, region)
   const tagText = tag === 'free'
     ? (t?.('row.free') ?? 'free')
     : tag === 'limited'
@@ -2285,6 +2329,7 @@ function CreditReserveRow({
  */
 function ModelRow({
   model,
+  region,
   t,
   draft,
   editable,
@@ -2293,6 +2338,8 @@ function ModelRow({
   onBudget,
 }: {
   model: PoolWebModel
+  /** Which gateway this row belongs to; the promo campaigns are regional. */
+  region: 'cn' | 'global'
   t?: PoolCardProps['t']
   draft: ModelDraftEntry
   editable: boolean
@@ -2300,14 +2347,38 @@ function ModelRow({
   onToggleImage: (id: string) => void
   onBudget: (id: string, budget: number) => void
 }) {
-  const tag = tagFor(model)
+  const now = new Date()
+  const tag = tagFor(model, now, region)
+  const promo = promoStatusFor(model, now, region)
   const tagText = tag === 'free'
     ? (t?.('row.free') ?? 'free')
     : tag === 'limited'
       ? (t?.('row.limitedFree') ?? 'limited free')
       : tag === 'night'
-        ? (t?.('row.nightDiscount') ?? 'night')
+        ? (t?.('row.nightFreeNow', { time: `${String(promo?.kind === 'night' ? promo.untilHour : 0).padStart(2, '0')}:00` })
+            ?? 'free until 08:00')
         : null
+  /**
+   * The "cheaper later" hint: the model is on a promotion but the window is
+   * closed. Deliberately NOT a "free" badge — it costs credits at this moment,
+   * and telling the user otherwise would change what they spend.
+   */
+  const laterHint = promo?.kind === 'night-later'
+    ? (t?.('row.nightFreeLater', { time: `${String(promo.nextHour).padStart(2, '0')}:00` })
+        ?? `free from ${String(promo.nextHour).padStart(2, '0')}:00`)
+    : null
+  /**
+   * How long the campaign itself runs, e.g. "活动至 10-31".
+   *
+   * Shown on both the free and the not-yet-free row, because the useful question
+   * is not only "is it free now" but "until when is this offer good at all" —
+   * an extension changes that date, and a user planning around the promotion
+   * needs it visible rather than buried in a changelog.
+   */
+  const promoUntil = promo === undefined || promo.kind === 'free'
+    ? null
+    : (t?.('row.promoUntil', { date: promo.promoUntil.slice(5).replace('-', '-') })
+        ?? `promo until ${promo.promoUntil}`)
 
   const native = model.nativeContextWindow
   const capped = native > DEFAULT_CONTEXT_BUDGET
@@ -2374,7 +2445,14 @@ function ModelRow({
               </label>
             </fieldset>
           : null}
-        <span className="dsm-workbuddy-xdpool-mrow-when">
+        {/* Promotion timing, next to the budget controls rather than in the head:
+            "free from 22:00" and "promo to 10-31" are planning context, so they
+            belong with the other per-model facts and not beside the name. */}
+        {laterHint === null ? null
+          : <span className="dsm-workbuddy-xdpool-model-meta-later">{laterHint}</span>}
+        {promoUntil === null ? null
+          : <span className="dsm-workbuddy-xdpool-model-meta-promo">{promoUntil}</span>}
+        <span className="dsm-workbuddy-xdpool-model-cap">
           {t?.('row.modelOutput', { size: formatCapacity(model.maxOutputTokens) })
             ?? `out ${formatCapacity(model.maxOutputTokens)}`}
         </span>
